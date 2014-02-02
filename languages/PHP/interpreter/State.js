@@ -39,6 +39,7 @@ define([
         this.path = null;
         this.referenceFactory = new ReferenceFactory(valueFactory);
         this.callStack = callStack;
+        this.resumeData = null;
         this.valueFactory = valueFactory;
     }
 
@@ -71,12 +72,20 @@ define([
             return this.referenceFactory;
         },
 
+        getResumeData: function () {
+            return this.resumeData;
+        },
+
         getValueFactory: function () {
             return this.valueFactory;
         },
 
         isMainProgram: function () {
             return this.path === null;
+        },
+
+        setResumeData: function (data) {
+            this.resumeData = data;
         },
 
         setPath: function (path) {

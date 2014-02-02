@@ -16,6 +16,7 @@ define([
     './interpreter/builtin/builtins',
     'js/util',
     './interpreter/Call',
+    './interpreter/Deferment',
     'js/Exception',
     './interpreter/KeyValuePair',
     './interpreter/LabelRepository',
@@ -26,11 +27,13 @@ define([
     './interpreter/Error/Fatal',
     './interpreter/State',
     'js/Promise',
-    './interpreter/Scope'
+    './interpreter/Scope',
+    'js/WeakMap'
 ], function (
     builtinTypes,
     util,
     Call,
+    Deferment,
     Exception,
     KeyValuePair,
     LabelRepository,
@@ -41,7 +44,8 @@ define([
     PHPFatalError,
     PHPState,
     Promise,
-    Scope
+    Scope,
+    WeakMap
 ) {
     'use strict';
 
@@ -80,7 +84,7 @@ define([
             }
         };
 
-    function evaluateModule(state, code, context, stdin, stdout, stderr) {
+    function evaluateModule(interpreter, programNode, state, code, context, rowColumnToNodeMap, stdin, stdout, stderr) {
         function require(path) {
             var done = false,
                 promise = new Promise(),
@@ -147,6 +151,9 @@ define([
                 getPathDirectory: function () {
                     return valueFactory.createString(state.getPath().replace(/\/[^\/]+$/, ''));
                 },
+                getResumeValue: function () {
+                    return valueFactory.coerce(context.resume.value);
+                },
                 implyArray: function (variable) {
                     // Undefined variables and variables containing null may be implicitly converted to arrays
                     if (!variable.isDefined() || variable.getValue().getType() === 'null') {
@@ -205,7 +212,7 @@ define([
         // Push the 'main' global scope call onto the stack
         callStack.push(new Call(globalScope));
 
-        code = 'var namespaceScope = tools.createNamespaceScope(namespace), scope = globalScope;' + code;
+        code = 'var namespaceScope = tools.createNamespaceScope(namespace), scope = globalScope;\n' + code;
 
         // Program returns null rather than undefined if nothing is returned
         code += 'return tools.valueFactory.createNull();';
@@ -216,6 +223,25 @@ define([
                 stdin, stdout, stderr, tools, callStack, globalScope, globalNamespace
             );
         } catch (exception) {
+            if (exception instanceof Deferment) {
+                exception.done(function (result) {
+                    var stackASTNodes = exception.getStackASTNodes(rowColumnToNodeMap);
+
+                    state.setResumeData({
+                        node: stackASTNodes[0],
+                        value: result
+                    });
+
+                    interpreter.interpret(programNode).done(function (nativeResult, type) {
+                        promise.resolve(nativeResult, type);
+                    }).fail(function (exception) {
+                        promise.reject(exception);
+                    });
+                });
+
+                return promise;
+            }
+
             if (exception instanceof PHPError) {
                 if (context.mainProgram) {
                     stderr.write(exception.message);
@@ -566,14 +592,14 @@ define([
 
                 return 'namespace.defineFunction(' + JSON.stringify(node.func) + ', ' + func + ');';
             },
-            'N_FUNCTION_CALL': function (node, interpret) {
+            'N_FUNCTION_CALL': function (node, interpret, context) {
                 var args = [];
 
                 util.each(node.args, function (arg) {
                     args.push(interpret(arg));
                 });
 
-                return '(' + interpret(node.func, {getValue: true}) + '.call([' + args.join(', ') + '], namespaceScope) || tools.valueFactory.createNull())';
+                return '(' + interpret(node.func, {getValue: true}) + '.call' + context.getAnchor(node) + '([' + args.join(', ') + '], namespaceScope) || tools.valueFactory.createNull())';
             },
             'N_GOTO_STATEMENT': function (node, interpret, context) {
                 var code = '',
@@ -680,8 +706,12 @@ define([
             'N_MAGIC_LINE_CONSTANT': function (node) {
                 return 'tools.valueFactory.createInteger(' + node.offset.line + ')';
             },
-            'N_METHOD_CALL': function (node, interpret) {
+            'N_METHOD_CALL': function (node, interpret, context) {
                 var code = '';
+
+                if (context.resume && node === context.resume.node) {
+                    return 'tools.getResumeValue()';
+                }
 
                 util.each(node.calls, function (call) {
                     var args = [];
@@ -690,7 +720,7 @@ define([
                         args.push(interpret(arg));
                     });
 
-                    code += '.callMethod(' + interpret(call.func) + '.getNative(), [' + args.join(', ') + '])';
+                    code += '.' + context.getAnchor(node) + 'callMethod(' + interpret(call.func) + '.getNative(), [' + args.join(', ') + '])';
                 });
 
                 return interpret(node.object) + code;
@@ -750,13 +780,36 @@ define([
                 return '(stdout.write(' + interpret(node.operand) + '.coerceToString().getNative()), tools.valueFactory.createInteger(1))';
             },
             'N_PROGRAM': function (node, interpret, state, stdin, stdout, stderr) {
-                var body = '',
+                var anchorOffsets = 0,
+                    body = '',
                     context = {
+                        getAnchor: function (node) {
+                            var data = nodeData.get(node);
+
+                            if (!data) {
+                                data = {
+                                    guid: nextNodeGUID++
+                                };
+                                guidToNode[data.guid] = node;
+                                nodeData.set(node, data);
+                            }
+
+                            return '/*#UNITER-' + data.guid + '#*/';
+                        },
                         labelRepository: new LabelRepository(),
                         mainProgram: state.isMainProgram(),
-                        path: state.getPath()
+                        path: state.getPath(),
+                        resume: state.getResumeData()
                     },
-                    labels;
+                    guidToNode = {},
+                    labels,
+                    nextNodeGUID = 0,
+                    nodeData = new WeakMap(),
+                    rowColumnToNodeMap = {};
+
+                function getCount(string, substring) {
+                    return string.split(substring).length;
+                }
 
                 try {
                     body += processBlock(hoistDeclarations(node.statements), interpret, context);
@@ -774,7 +827,26 @@ define([
                     body = 'var goingToLabel_' + labels.join(' = false, goingToLabel_') + ' = false;' + body;
                 }
 
-                return evaluateModule(state, body, context, stdin, stdout, stderr);
+                body = body.replace(/\/\*#UNITER-(\d+)#\*\//g, function (all, guid, offset) {
+                    var node,
+                        row,
+                        column;
+
+                    offset -= anchorOffsets;
+
+                    node = guidToNode[guid];
+                    row = getCount(body.substr(0, offset), '\n');
+                    column = offset - body.lastIndexOf('\n', offset);
+
+                    rowColumnToNodeMap[row + ',' + column] = node;
+
+                    anchorOffsets += all.length;
+
+                    // Remove the comment from the code
+                    return '';
+                });
+
+                return evaluateModule(this, node, state, body, context, rowColumnToNodeMap, stdin, stdout, stderr);
             },
             'N_REQUIRE_EXPRESSION': function (node, interpret) {
                 return 'tools.require(' + interpret(node.path) + '.getNative())';
