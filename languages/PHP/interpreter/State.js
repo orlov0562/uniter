@@ -15,6 +15,7 @@ define([
     './Namespace',
     './ReferenceFactory',
     './Scope',
+    './Timer',
     './ValueFactory'
 ], function (
     phpUtil,
@@ -23,22 +24,27 @@ define([
     Namespace,
     ReferenceFactory,
     Scope,
+    Timer,
     ValueFactory
 ) {
     'use strict';
 
     function PHPState(stderr, engine, options) {
         var callStack = new CallStack(stderr),
+            timer = new Timer(),
             valueFactory = new ValueFactory(callStack);
 
         this.callStack = callStack;
         this.engine = engine;
         this.globalNamespace = new Namespace(callStack, valueFactory, null, '');
         this.globalScope = new Scope(callStack, valueFactory, null);
+        this.maxSeconds = 1;
         this.options = options;
         this.path = null;
         this.referenceFactory = new ReferenceFactory(valueFactory);
         this.callStack = callStack;
+        this.timeoutTime = timer.getMilliseconds() + 1000;
+        this.timer = timer;
         this.valueFactory = valueFactory;
     }
 
@@ -59,6 +65,10 @@ define([
             return this.globalScope;
         },
 
+        getMaxSeconds: function () {
+            return this.maxSeconds;
+        },
+
         getOptions: function () {
             return this.options;
         },
@@ -71,6 +81,14 @@ define([
             return this.referenceFactory;
         },
 
+        getTimeoutTime: function () {
+            return this.timeoutTime;
+        },
+
+        getTimer: function () {
+            return this.timer;
+        },
+
         getValueFactory: function () {
             return this.valueFactory;
         },
@@ -81,6 +99,13 @@ define([
 
         setPath: function (path) {
             this.path = path;
+        },
+
+        setTimeLimit: function (maxSeconds) {
+            var state = this;
+
+            state.maxSeconds = maxSeconds;
+            state.timeoutTime = state.timer.getMilliseconds() + maxSeconds * 1000;
         }
     });
 
